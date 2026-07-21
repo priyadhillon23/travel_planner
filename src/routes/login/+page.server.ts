@@ -1,0 +1,67 @@
+import { fail, redirect, type Actions } from '@sveltejs/kit';
+import type { PageServerLoad } from './$types';
+import * as usersRepo from '$lib/server/repositories/usersRepo';
+import { verifyPassword, createSession, sessionCookieOptions } from '$lib/server/auth';
+import { checkRateLimit } from '$lib/server/rateLimit';
+import { normalizeEmail } from '$lib/server/users';
+import { isTwoFactorEnabled, createPendingCookie } from '$lib/server/twoFactor';
+import { isPasskeyAvailable } from '$lib/server/passkeys';
+
+export async function _authenticate(email: string, password: string) {
+	const u = usersRepo.getUserByEmail(normalizeEmail(email));
+	if (!u || u.disabled || !(await verifyPassword(u.password_hash, password))) return null;
+	return {
+		id: Number(u.id),
+		email: u.email,
+		displayName: u.display_name ?? '',
+		role: u.role,
+		disabled: u.disabled,
+		mustResetPassword: u.must_reset_password,
+		timezone: u.timezone,
+		emailNotifications: u.email_notifications,
+		webhookNotifications: u.webhook_notifications
+	};
+}
+
+export const load: PageServerLoad = () => {
+	return { passkeyAvailable: isPasskeyAvailable() };
+};
+
+function safeNext(url: URL | undefined): string | null {
+	if (!url) return null;
+	const next = url.searchParams.get('next');
+	if (!next) return null;
+	// Only allow same-origin relative paths to prevent open redirects.
+	if (next.startsWith('/') && !next.startsWith('//')) return next;
+	return null;
+}
+
+export const actions: Actions = {
+	default: async ({ request, cookies, getClientAddress, url }) => {
+		const limit = checkRateLimit(getClientAddress(), 'login');
+		if (!limit.allowed)
+			return fail(429, {
+				error: 'Too many attempts. Try again later.',
+				retryAfter: limit.retryAfter
+			});
+		const f = await request.formData();
+		const u = await _authenticate(String(f.get('email') ?? ''), String(f.get('password') ?? ''));
+		if (!u) return fail(401, { error: 'Invalid email or password.' });
+
+		const ip = getClientAddress();
+		const ua = request.headers.get('user-agent') ?? undefined;
+		const next = safeNext(url);
+
+		if (isTwoFactorEnabled(u.id)) {
+			const pending = createPendingCookie(u.id, ip, ua);
+			cookies.set('tfa_pending', pending.value, {
+				...sessionCookieOptions(),
+				maxAge: pending.maxAge
+			});
+			throw redirect(303, next ? `/login/verify?next=${encodeURIComponent(next)}` : '/login/verify');
+		}
+
+		cookies.set('session', createSession(u.id, ip, ua), sessionCookieOptions());
+		throw redirect(303, next ?? '/');
+	}
+};

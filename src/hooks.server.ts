@@ -1,0 +1,293 @@
+import { redirect, error, type Handle, type HandleServerError, isRedirect, type Redirect } from '@sveltejs/kit';
+import { dev } from '$app/environment';
+import { validateOAuthUser, validateSession, updateSessionMetadata } from '$lib/server/auth';
+import { verifyAccessToken, type Scope } from '$lib/server/oauth';
+import { isSetupComplete } from '$lib/server/settings';
+import { bootApp, isMissingSecret, getBootError } from '$lib/server/boot';
+import { tileCspOrigins } from '$lib/server/mapTiles';
+import type { ToastVariant } from '$lib/toast';
+
+// Run one-time boot (secret guard → migrations → settings row → scheduler) at process
+// start. A failed migration or missing ROAMARR_SECRET is recorded so the setup page
+// can render diagnostics instead of crashing the process. The handle hook below blocks
+// every other route and the setup action when boot did not complete.
+// Idempotent; safe under Vite HMR (the `booted` flag short-circuits re-runs) and build
+// (vite bundles without executing, and there are no prerender entries that would).
+bootApp();
+
+const PUBLIC = [/^\/setup/, /^\/login/, /^\/register/, /^\/invite\//, /^\/forgot-password/, /^\/reset-password\//, /^\/share\//, /^\/trips\/\d+\/calendar\/feed$/, /^\/api\/webauthn\/auth\//, /^\/oauth\/authorize/, /^\/oauth\/register$/, /^\/oauth\/token/, /^\/oauth\/revoke/, /^\/\.well-known\//, /^\/mcp/, /^\/health$/, /^\/health\/deep$/];
+const OAUTH_FORM_ENDPOINTS = new Set(['/oauth/token', '/oauth/revoke']);
+const FORM_CONTENT_TYPES = new Set([
+	'application/x-www-form-urlencoded',
+	'multipart/form-data',
+	'text/plain'
+]);
+const UNSAFE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+export function isForbiddenCrossSiteForm(request: Request, url: URL): boolean {
+	if (OAUTH_FORM_ENDPOINTS.has(url.pathname) || !UNSAFE_METHODS.has(request.method)) return false;
+	// Cookie-session browser form CSRF only. Mobile/native clients authenticate with
+	// Bearer tokens and often omit Origin (or send a non-site Origin) on multipart
+	// uploads — blocking those breaks poster/receipt uploads from the app.
+	if (/^Bearer\s+\S+/i.test(request.headers.get('authorization') ?? '')) return false;
+	const contentType = request.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase();
+	return !!contentType && FORM_CONTENT_TYPES.has(contentType) && request.headers.get('origin') !== url.origin;
+}
+
+export function requiredApiScope(path: string, method: string): Scope | null {
+	const access = method === 'GET' || method === 'HEAD' ? 'read' : 'write';
+	const routes: Array<[RegExp, string]> = [
+		[/^\/api\/mobile\/trips\/\d+\/sharing(?:\/|$)/, 'sharing'],
+		[/^\/api\/trips(?:\/|$)/, 'trips'],
+		[/^\/api\/mobile\/trips(?:\/|$)/, 'trips'],
+		[/^\/api\/mobile\/segments(?:\/|$)/, 'segments'],
+		[/^\/api\/mobile\/trip-transfer(?:\/|$)/, 'trips'],
+		[/^\/api\/mobile\/trip-merge(?:\/|$)/, 'trips'],
+		[/^\/api\/mobile\/expenses(?:\/|$)/, 'expenses'],
+		[/^\/api\/cards(?:\/|$)/, 'cards'],
+		[/^\/api\/loyalty(?:\/|$)/, 'loyalty'],
+		[/^\/api\/insurance(?:\/|$)/, 'insurance'],
+		[/^\/api\/travel-documents(?:\/|$)/, 'travel-docs'],
+		[/^\/api\/reminders(?:\/|$)/, 'reminders'],
+		[/^\/api\/mobile\/notifications(?:\/|$)/, 'notifications'],
+		[/^\/api\/mobile\/calendar(?:\/|$)/, 'calendar'],
+		[/^\/api\/fare-watches(?:\/|$)/, 'fares'],
+		[/^\/api\/fare-providers(?:\/|$)/, 'fares'],
+		[/^\/api\/groups(?:\/|$)/, 'sharing'],
+		[/^\/api\/(?:cities|maps)(?:\/|$)/, 'places'],
+		[/^\/api\/mobile-admin(?:\/|$)/, 'admin'],
+		[/^\/api\/(?:audit-logs|jobs)(?:\/|$)/, 'admin'],
+		[/^\/api\/mobile\/admin-backup(?:\/|$)/, 'admin'],
+		[/^\/api\/mobile\/admin-maps(?:\/|$)/, 'admin'],
+		[/^\/api\/mobile\/security(?:\/|$)/, 'security'],
+		[/^\/api\/mobile\/email-processing(?:\/|$)/, 'profile-prefs'],
+		[/^\/api\/webauthn\/register(?:\/|$)/, 'security']
+	];
+	const resource = routes.find(([pattern]) => pattern.test(path))?.[1];
+	return resource ? `${resource}:${access}` as Scope : null;
+}
+
+function jsonError(status: number, message: string) {
+	return applySecurityHeaders(new Response(JSON.stringify({ error: message }), {
+		status,
+		headers: { 'content-type': 'application/json' }
+	}));
+}
+
+function contentSecurityPolicy(path = '') {
+	// Allow the configured map tile provider (origin only) so MapLibre can fetch tiles,
+	// and blob: workers since MapLibre runs its renderer in a blob-sourced Web Worker.
+	const tiles = tileCspOrigins();
+	const directives: Record<string, string[]> = {
+		'default-src': ["'self'"],
+		'script-src': ["'self'", "'unsafe-inline'"],
+		'style-src': ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+		'font-src': ["'self'", 'https://fonts.gstatic.com'],
+		'img-src': ["'self'", 'data:', 'blob:', ...tiles],
+		'connect-src': [...(dev ? ["'self'", 'ws:', 'wss:'] : ["'self'"]), ...tiles],
+		'worker-src': ["'self'", 'blob:'],
+		'base-uri': ["'self'"],
+		'frame-ancestors': ["'none'"],
+		'object-src': ["'none'"]
+	};
+	// OAuth consent redirects the form submission to the client's validated,
+	// registered callback. form-action 'self' blocks that redirect in browsers.
+	if (path !== '/oauth/authorize') directives['form-action'] = ["'self'"];
+	return Object.entries(directives)
+		.map(([directive, values]) => `${directive} ${values.join(' ')}`)
+		.join('; ');
+}
+
+function isAllowedDuringSetupIssue(path: string) {
+	return (
+		path === '/setup' ||
+		path === '/boot-error' ||
+		path.startsWith('/_app/') ||
+		path.startsWith('/static/') ||
+		path.startsWith('/maps/') ||
+		path === '/favicon.ico' ||
+		path === '/manifest.json' ||
+		path.startsWith('/icon-') ||
+		path === '/apple-touch-icon.png' ||
+		path === '/logo-transparent.png' ||
+		path === '/alt-logo-transparent.png'
+	);
+}
+
+function isAssetOrHealthPath(path: string) {
+	return (
+		path === '/boot-error' ||
+		path === '/health' ||
+		path === '/health/deep' ||
+		path.startsWith('/_app/') ||
+		path.startsWith('/static/') ||
+		path.startsWith('/maps/') ||
+		path === '/favicon.ico' ||
+		path === '/manifest.json' ||
+		path.startsWith('/icon-') ||
+		path === '/apple-touch-icon.png' ||
+		path === '/logo-transparent.png' ||
+		path === '/alt-logo-transparent.png'
+	);
+}
+
+/**
+ * Best-effort check of whether setup has already been completed. Returns
+ * `true` (i.e. assume configured) when the DB itself can't be probed — the
+ * safer default when something is broken, since re-exposing /setup on a
+ * configured instance is a security regression.
+ */
+function safeIsSetupComplete(): boolean {
+	try {
+		return isSetupComplete();
+	} catch {
+		return true;
+	}
+}
+
+function applySecurityHeaders(response: Response, path = '') {
+	response.headers.set('X-Frame-Options', 'DENY');
+	response.headers.set('X-Content-Type-Options', 'nosniff');
+	response.headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+	response.headers.set('Content-Security-Policy', contentSecurityPolicy(path));
+	// HSTS is ignored by browsers over plain HTTP, so it is safe to send in dev,
+	// but only meaningful when the app is served over HTTPS.
+	response.headers.set('Strict-Transport-Security', 'max-age=63072000; includeSubDomains; preload');
+	return response;
+}
+
+function isOAuthCorsPath(path: string) {
+	return /^\/(?:oauth\/(?:register|token|revoke)|\.well-known\/(?:oauth-authorization-server|mcp\.json)|mcp)$/.test(path);
+}
+
+function applyOAuthCors(response: Response, path: string) {
+	if (!isOAuthCorsPath(path)) return response;
+	response.headers.set('Access-Control-Allow-Origin', '*');
+	response.headers.set('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+	response.headers.set('Access-Control-Allow-Headers', 'Authorization, Content-Type, MCP-Protocol-Version, MCP-Session-Id');
+	response.headers.set('Access-Control-Expose-Headers', 'MCP-Session-Id');
+	return response;
+}
+
+function redirectResponse(e: Redirect) {
+	return new Response(null, { status: e.status, headers: { location: e.location } });
+}
+
+export const handle: Handle = async ({ event, resolve }) => {
+	try {
+		const path = event.url.pathname;
+		if (!dev && isForbiddenCrossSiteForm(event.request, event.url)) {
+			return new Response(`Cross-site ${event.request.method} form submissions are forbidden`, {
+				status: 403
+			});
+		}
+		if (event.request.method === 'OPTIONS' && isOAuthCorsPath(path)) {
+			return applyOAuthCors(applySecurityHeaders(new Response(null, { status: 204 }), path), path);
+		}
+		const bootError = getBootError();
+
+		if (isMissingSecret() || bootError) {
+			event.locals.user = null;
+			event.locals.missingSecret = isMissingSecret();
+			event.locals.bootError = bootError;
+
+			// Security invariant: once setup has been completed, the /setup
+			// wizard must NEVER be re-exposed — not even when migrations fail,
+			// the secret disappears, or any other boot error occurs. A
+			// configured instance shows a dedicated /boot-error page instead,
+			// so the admin-creation form cannot be used to take over a deployed
+			// instance that hit a transient (or permanent) boot problem.
+			const setupComplete = safeIsSetupComplete();
+			if (setupComplete) {
+				if (path !== '/boot-error' && !isAssetOrHealthPath(path)) {
+					throw redirect(307, '/boot-error');
+				}
+			} else {
+				if (!isAllowedDuringSetupIssue(path)) {
+					throw redirect(307, '/setup');
+				}
+			}
+			return applyOAuthCors(applySecurityHeaders(await resolve(event), path), path);
+		}
+
+		const sessionToken = event.cookies.get('session');
+		const bearer = event.request.headers.get('authorization')?.match(/^Bearer\s+(.+)$/i)?.[1];
+		event.locals.oauth = bearer ? verifyAccessToken(bearer) ?? undefined : undefined;
+		event.locals.user = event.locals.oauth
+			? validateOAuthUser(event.locals.oauth.userId)
+			: await validateSession(sessionToken);
+		if (bearer && !event.locals.oauth) return jsonError(401, 'Invalid or expired access token');
+		if (bearer && path.startsWith('/api/')) {
+			const oauth = event.locals.oauth!;
+			const scope = requiredApiScope(path, event.request.method);
+			if (!scope || !oauth.scopes.includes(scope)) {
+				return jsonError(403, scope ? `Missing required scope: ${scope}` : 'OAuth access is not allowed for this endpoint');
+			}
+		}
+		if (sessionToken && event.locals.user) {
+			try {
+				updateSessionMetadata(sessionToken, event.getClientAddress(), event.request.headers.get('user-agent') ?? undefined);
+			} catch {
+				// best-effort; getClientAddress may throw in some environments
+			}
+		}
+
+		const flashRaw = event.cookies.get('flash');
+		if (flashRaw) {
+			let flash: string | { message: string; variant?: ToastVariant } = flashRaw;
+			try {
+				const parsed = JSON.parse(flashRaw);
+				if (parsed && typeof parsed.message === 'string') {
+					const variant = ['success', 'error', 'info', 'warning'].includes(parsed.variant)
+						? (parsed.variant as ToastVariant)
+						: undefined;
+					flash = { message: parsed.message, variant };
+				}
+			} catch {
+				// keep plain string flash
+			}
+			event.locals.flash = flash;
+			event.cookies.set('flash', '', { path: '/', maxAge: 0 });
+		}
+
+		if (!isSetupComplete() && path !== '/setup' && path !== '/health' && path !== '/health/deep') throw redirect(302, '/setup');
+		if (isSetupComplete() && path === '/setup') throw redirect(302, '/login');
+
+		const isPublic = PUBLIC.some((re) => re.test(path));
+		if (!isPublic && !event.locals.user && isSetupComplete()) throw redirect(302, '/login');
+
+		if (event.locals.user?.mustResetPassword) {
+			const allowed = path === '/profile/change-password' || path === '/logout';
+			if (!allowed) throw redirect(302, '/profile/change-password');
+		}
+
+		return applyOAuthCors(applySecurityHeaders(await resolve(event), path), path);
+	} catch (e) {
+		if (isRedirect(e)) return applySecurityHeaders(redirectResponse(e), event.url.pathname);
+
+		// Catch native engine errors (InvalidArgument, KitValidationError, NOT
+		// NULL violations, type mismatches) that escape repo-level wrappers.
+		// Convert to a clean 400 so the user sees a friendly error page, not
+		// a raw stack trace or 500.
+		const msg = e instanceof Error ? e.message : String(e);
+		if (
+			msg.includes('NOT NULL') ||
+			msg.includes('must be a') ||
+			msg.includes('InvalidArgument') ||
+			msg.includes('cannot be null')
+		) {
+			console.error('[hooks] engine error on', event.url.pathname, ':', msg);
+			throw error(400, 'The data couldn\'t be saved due to a validation issue. An administrator should check the server logs.');
+		}
+		throw e;
+	}
+};
+
+// Log unexpected errors server-side without exposing details to the client.
+// SvelteKit renders src/error.svelte with the status + a safe message.
+export const handleError: HandleServerError = ({ error, event }) => {
+	console.error('Unhandled server error:', error?.toString?.() ?? String(error), 'on', event.url.pathname);
+	return {
+		message: 'Something went wrong. Please try again.'
+	};
+};

@@ -1,0 +1,275 @@
+import { test, expect, describe, beforeEach, afterEach } from 'vitest';
+import { existsSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import {
+	encryptChunkedFile,
+	decryptChunkedFileStream,
+	CHUNK_SIZE,
+	INDEX_LENGTH,
+	LEN_LENGTH,
+	TAG_LENGTH,
+	HEADER_LENGTH,
+	FOOTER_INDEX
+} from './attachmentCrypto';
+import { streamToBuffer } from '../../../../tests/helpers';
+
+function streamFromBuffer(b: Buffer | string): ReadableStream<Uint8Array> {
+	const buf = Buffer.isBuffer(b) ? b : Buffer.from(b);
+	return new ReadableStream({
+		start(controller) {
+			controller.enqueue(new Uint8Array(buf));
+			controller.close();
+		}
+	});
+}
+
+function streamFromBufferChunks(b: Buffer, chunkSize: number): ReadableStream<Uint8Array> {
+	let offset = 0;
+	return new ReadableStream({
+		pull(controller) {
+			if (offset >= b.length) {
+				controller.close();
+				return;
+			}
+			const end = Math.min(b.length, offset + chunkSize);
+			controller.enqueue(new Uint8Array(b.subarray(offset, end)));
+			offset = end;
+		}
+	});
+}
+
+describe('attachmentCrypto', () => {
+	let dir: string;
+	let originalSecret: string | undefined;
+	beforeEach(() => {
+		dir = mkdtempSync(path.join(tmpdir(), 'roamarr-attach-'));
+		originalSecret = process.env.ROAMARR_SECRET;
+		process.env.ROAMARR_SECRET = 'ACpm0VlkwltJpcNWtxlilgjX+ZbW2nTV7QqYbZK0Fig=';
+	});
+	afterEach(() => {
+		if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+		if (originalSecret === undefined) {
+			delete process.env.ROAMARR_SECRET;
+		} else {
+			process.env.ROAMARR_SECRET = originalSecret;
+		}
+	});
+
+	test('round-trips a small file', async () => {
+		const plain = 'hello encrypted world';
+		const cipherPath = path.join(dir, 'cipher');
+		await encryptChunkedFile(streamFromBuffer(plain), cipherPath);
+		const out = await streamToBuffer(await decryptChunkedFileStream(cipherPath));
+		expect(out.toString('utf8')).toBe(plain);
+	});
+
+	test('round-trips a 1 MB file', async () => {
+		const plain = Buffer.alloc(1024 * 1024, 'a');
+		const cipherPath = path.join(dir, 'cipher');
+		await encryptChunkedFile(streamFromBufferChunks(plain, 8192), cipherPath);
+		const out = await streamToBuffer(await decryptChunkedFileStream(cipherPath));
+		expect(out.equals(plain)).toBe(true);
+	});
+
+	test('round-trips an empty file', async () => {
+		const cipherPath = path.join(dir, 'cipher');
+		await encryptChunkedFile(streamFromBuffer(''), cipherPath);
+		const out = await streamToBuffer(await decryptChunkedFileStream(cipherPath));
+		expect(out.length).toBe(0);
+	});
+
+	test('round-trips a file that spans multiple chunks', async () => {
+		const plain = Buffer.alloc(CHUNK_SIZE * 3 + 17, 'x');
+		const cipherPath = path.join(dir, 'cipher');
+		await encryptChunkedFile(streamFromBufferChunks(plain, CHUNK_SIZE), cipherPath);
+		const out = await streamToBuffer(await decryptChunkedFileStream(cipherPath));
+		expect(out.equals(plain)).toBe(true);
+	});
+
+	test('reports actual plaintext bytes and chunk count', async () => {
+		const plain = Buffer.alloc(CHUNK_SIZE + 100, 'y');
+		const cipherPath = path.join(dir, 'cipher');
+		const result = await encryptChunkedFile(streamFromBuffer(plain), cipherPath);
+		expect(result.plaintextBytes).toBe(plain.length);
+		expect(result.chunkCount).toBe(2);
+	});
+
+	test('enforces maxBytes during encryption', async () => {
+		const plain = Buffer.alloc(100);
+		const cipherPath = path.join(dir, 'cipher');
+		await expect(
+			encryptChunkedFile(streamFromBuffer(plain), cipherPath, { maxBytes: 50 })
+		).rejects.toThrow();
+	});
+
+	test('cleans up temp file on encryption failure', async () => {
+		const cipherPath = path.join(dir, 'cipher');
+		const badStream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(new Uint8Array(Buffer.from('data')));
+				controller.error(new Error('stream error'));
+			}
+		});
+		await expect(encryptChunkedFile(badStream, cipherPath)).rejects.toThrow();
+		expect(existsSync(cipherPath)).toBe(false);
+		expect(existsSync(`${cipherPath}.tmp`)).toBe(false);
+	});
+
+	test('tampered chunk fails decryption', async () => {
+		const plain = 'secret';
+		const cipherPath = path.join(dir, 'cipher');
+		await encryptChunkedFile(streamFromBuffer(plain), cipherPath);
+		const bytes = readFileSync(cipherPath);
+		bytes[30] ^= 0xff;
+		writeFileSync(cipherPath, bytes);
+		await expect(streamToBuffer(await decryptChunkedFileStream(cipherPath))).rejects.toThrow();
+	});
+
+	test('truncated final tag fails decryption', async () => {
+		const plain = 'secret';
+		const cipherPath = path.join(dir, 'cipher');
+		await encryptChunkedFile(streamFromBuffer(plain), cipherPath);
+		const bytes = readFileSync(cipherPath);
+		writeFileSync(cipherPath, bytes.subarray(0, bytes.length - 4));
+		await expect(streamToBuffer(await decryptChunkedFileStream(cipherPath))).rejects.toThrow();
+	});
+
+	test('truncation at a chunk boundary fails decryption', async () => {
+		const plain = Buffer.alloc(CHUNK_SIZE * 2, 'z');
+		const cipherPath = path.join(dir, 'cipher');
+		await encryptChunkedFile(streamFromBuffer(plain), cipherPath);
+		const bytes = readFileSync(cipherPath);
+		const footerStart = findFooterStart(bytes);
+		expect(footerStart).toBeGreaterThan(0);
+		const chunkStart = findPreviousChunkStart(bytes);
+		writeFileSync(cipherPath, bytes.subarray(0, chunkStart));
+		await expect(streamToBuffer(await decryptChunkedFileStream(cipherPath))).rejects.toThrow();
+	});
+
+	test('encrypted file has version 2 header', async () => {
+		const cipherPath = path.join(dir, 'cipher');
+		await encryptChunkedFile(streamFromBuffer('x'), cipherPath);
+		const bytes = readFileSync(cipherPath);
+		expect(bytes[0]).toBe(2);
+		expect(bytes.length).toBeGreaterThan(1 + 4 + 12 + 4 + 4 + 16 + 1);
+	});
+
+	test('rejects truncated header', async () => {
+		const plain = 'secret';
+		const cipherPath = path.join(dir, 'cipher');
+		await encryptChunkedFile(streamFromBuffer(plain), cipherPath);
+		const bytes = readFileSync(cipherPath);
+		writeFileSync(cipherPath, bytes.subarray(0, HEADER_LENGTH - 1));
+		await expect(streamToBuffer(await decryptChunkedFileStream(cipherPath))).rejects.toThrow(
+			/header truncated/
+		);
+	});
+
+	test('rejects unsupported version', async () => {
+		const plain = 'secret';
+		const cipherPath = path.join(dir, 'cipher');
+		await encryptChunkedFile(streamFromBuffer(plain), cipherPath);
+		const bytes = Buffer.from(readFileSync(cipherPath));
+		bytes[0] = 0x03;
+		writeFileSync(cipherPath, bytes);
+		await expect(streamToBuffer(await decryptChunkedFileStream(cipherPath))).rejects.toThrow(
+			/unsupported attachment encryption version/
+		);
+	});
+
+	test('rejects missing footer / EOF before footer', async () => {
+		const plain = Buffer.alloc(CHUNK_SIZE * 2, 'z');
+		const cipherPath = path.join(dir, 'cipher');
+		await encryptChunkedFile(streamFromBuffer(plain), cipherPath);
+		const bytes = readFileSync(cipherPath);
+		const offsets = getChunkOffsets(bytes);
+		expect(offsets.length).toBe(2);
+		writeFileSync(cipherPath, bytes.subarray(0, offsets[0] + INDEX_LENGTH + LEN_LENGTH + chunkCipherLength(bytes, offsets[0]) + TAG_LENGTH));
+		await expect(streamToBuffer(await decryptChunkedFileStream(cipherPath))).rejects.toThrow(
+			/footer missing/
+		);
+	});
+
+	test('rejects footer chunk-count mismatch', async () => {
+		const plain = Buffer.alloc(CHUNK_SIZE * 2, 'z');
+		const cipherPath = path.join(dir, 'cipher');
+		await encryptChunkedFile(streamFromBuffer(plain), cipherPath);
+		const bytes = readFileSync(cipherPath);
+		const offsets = getChunkOffsets(bytes);
+		expect(offsets.length).toBe(2);
+		const footerStart = findFooterStart(bytes);
+		expect(footerStart).toBeGreaterThan(0);
+		const chunk0 = bytes.subarray(offsets[0], offsets[1]);
+		const footer = bytes.subarray(footerStart);
+		const tampered = Buffer.concat([bytes.subarray(0, HEADER_LENGTH), chunk0, footer]);
+		writeFileSync(cipherPath, tampered);
+		await expect(streamToBuffer(await decryptChunkedFileStream(cipherPath))).rejects.toThrow(
+			/chunk count mismatch/
+		);
+	});
+
+	test('rejects out-of-order chunk index', async () => {
+		const plain = Buffer.alloc(CHUNK_SIZE * 2, 'z');
+		const cipherPath = path.join(dir, 'cipher');
+		await encryptChunkedFile(streamFromBuffer(plain), cipherPath);
+		const bytes = readFileSync(cipherPath);
+		const offsets = getChunkOffsets(bytes);
+		expect(offsets.length).toBe(2);
+		const footerStart = findFooterStart(bytes);
+		expect(footerStart).toBeGreaterThan(0);
+		const chunk0 = bytes.subarray(offsets[0], offsets[1]);
+		const chunk1 = bytes.subarray(offsets[1], footerStart);
+		const footer = bytes.subarray(footerStart);
+		const tampered = Buffer.concat([bytes.subarray(0, HEADER_LENGTH), chunk1, chunk0, footer]);
+		writeFileSync(cipherPath, tampered);
+		await expect(streamToBuffer(await decryptChunkedFileStream(cipherPath))).rejects.toThrow(
+			/chunk out of order/
+		);
+	});
+
+	test('rejects chunk length exceeding CHUNK_SIZE', async () => {
+		const plain = Buffer.alloc(CHUNK_SIZE, 'z');
+		const cipherPath = path.join(dir, 'cipher');
+		await encryptChunkedFile(streamFromBuffer(plain), cipherPath);
+		const bytes = Buffer.from(readFileSync(cipherPath));
+		const offsets = getChunkOffsets(bytes);
+		expect(offsets.length).toBe(1);
+		bytes.writeUInt32BE(CHUNK_SIZE + 1, offsets[0] + INDEX_LENGTH);
+		writeFileSync(cipherPath, bytes);
+		await expect(streamToBuffer(await decryptChunkedFileStream(cipherPath))).rejects.toThrow(
+			/chunk length exceeds stored maximum/
+		);
+	});
+});
+
+function findFooterStart(bytes: Buffer): number {
+	for (let i = bytes.length - TAG_LENGTH - LEN_LENGTH; i >= HEADER_LENGTH + INDEX_LENGTH + LEN_LENGTH; i--) {
+		if (bytes.readUInt32BE(i - INDEX_LENGTH) === 0xffffffff && bytes.readUInt32BE(i) === 8) {
+			return i - INDEX_LENGTH;
+		}
+	}
+	return -1;
+}
+
+function findPreviousChunkStart(bytes: Buffer): number {
+	const offsets = getChunkOffsets(bytes);
+	return offsets.length > 0 ? offsets[offsets.length - 1] : HEADER_LENGTH;
+}
+
+function chunkCipherLength(bytes: Buffer, chunkStart: number): number {
+	return bytes.readUInt32BE(chunkStart + INDEX_LENGTH);
+}
+
+function getChunkOffsets(bytes: Buffer): number[] {
+	const offsets: number[] = [];
+	let pos = HEADER_LENGTH;
+	while (pos < bytes.length) {
+		const index = bytes.readUInt32BE(pos);
+		const len = bytes.readUInt32BE(pos + INDEX_LENGTH);
+		if (index === FOOTER_INDEX) break;
+		offsets.push(pos);
+		pos += INDEX_LENGTH + LEN_LENGTH + len + TAG_LENGTH;
+	}
+	return offsets;
+}

@@ -1,0 +1,112 @@
+import { fail, redirect, type Actions } from '@sveltejs/kit';
+import type { PageServerLoad } from './$types';
+import { requireUser } from '$lib/server/auth';
+import { parseTripId } from '$lib/server/params';
+import { Validator } from '$lib/server/validation';
+import { deleteSegment, deleteSegments, updateSegment } from '$lib/server/segments';
+import { SEGMENT_PAYMENT_STATUSES } from '$lib/server/db/mongrelSchema';
+import { citySelectionError } from '$lib/server/cities';
+
+export const load: PageServerLoad = ({ params }) => {
+	throw redirect(308, `/trips/${params.id}`);
+};
+
+export const actions: Actions = {
+	delete: async ({ request, locals, params }) => {
+		const u = requireUser(locals);
+		const f = await request.formData();
+		const v = new Validator();
+		const segmentId = v.positiveId(f.get('segmentId'), 'segmentId');
+		if (!v.ok()) return fail(400, { error: v.failMessage(), errors: v.errors });
+		deleteSegment(u.id, parseTripId(params), segmentId!);
+		throw redirect(303, `/trips/${params.id}`);
+	},
+	deleteMany: async ({ request, locals, params }) => {
+		const u = requireUser(locals);
+		const f = await request.formData();
+		const v = new Validator();
+		const ids = f.getAll('segmentId').map((raw) => v.positiveId(raw, 'segmentId')).filter((id): id is number => id != null);
+		if (!v.ok() || ids.length === 0) {
+			return fail(400, { error: 'Select at least one segment to delete', errors: v.errors });
+		}
+		deleteSegments(u.id, parseTripId(params), ids);
+		throw redirect(303, `/trips/${params.id}`);
+	},
+	update: async ({ request, locals, params }) => {
+		const u = requireUser(locals);
+		const f = await request.formData();
+		let details: object | undefined;
+		const detailsRaw = String(f.get('detailsJson') || '');
+		const v = new Validator();
+		if (detailsRaw) {
+			try {
+				details = JSON.parse(detailsRaw);
+			} catch {
+				v.addError('detailsJson', 'Invalid details JSON');
+			}
+		}
+		const segmentId = v.positiveId(f.get('segmentId'), 'segmentId');
+		const title = v.requiredString(f.get('title'), 'title', { max: 200 });
+		const localStart = v.requiredDateTime(f.get('localStart'), 'localStart');
+		const startTz = v.timezone(f.get('startTz') || u.timezone, 'startTz');
+		const endAt = v.dateTime(f.get('endAt'), 'endAt');
+		const endTz = v.timezone(f.get('endTz') || startTz, 'endTz');
+		const location = v.optionalString(f.get('location'), 'location', { max: 200 });
+		const countryCode =
+			f.get('countryCode') && String(f.get('countryCode')).trim()
+				? v.countryCode(f.get('countryCode'), 'countryCode')
+				: undefined;
+		const cityName = v.optionalString(f.get('cityName'), 'cityName', { max: 200 });
+		const cityLat = f.get('cityLat') ? v.latitude(f.get('cityLat'), 'cityLat') : undefined;
+		const cityLng = f.get('cityLng') ? v.longitude(f.get('cityLng'), 'cityLng') : undefined;
+		const venue = v.optionalString(f.get('venue'), 'venue', { max: 200 });
+
+		if (countryCode && cityName) {
+			const error = citySelectionError(countryCode, cityName, cityLat, cityLng);
+			if (error) v.addError('cityName', error);
+		}
+
+		const confirmationNumber = v.optionalString(
+			f.get('confirmationNumber'),
+			'confirmationNumber',
+			{ max: 100 }
+		);
+		const meetingPoint = v.optionalString(f.get('meetingPoint'), 'meetingPoint', { max: 200 });
+		const meetingAt = v.dateTime(f.get('meetingAt'), 'meetingAt');
+		const cardId = f.get('cardId') ? v.positiveId(f.get('cardId'), 'cardId') : undefined;
+		const paymentStatusRaw = f.get('paymentStatus');
+		const paymentStatus =
+			paymentStatusRaw && String(paymentStatusRaw).trim()
+				? v.enumValue(
+						String(paymentStatusRaw).trim(),
+						SEGMENT_PAYMENT_STATUSES as readonly string[],
+						'paymentStatus'
+					)
+				: undefined;
+		const paymentDueDate = v.date(f.get('paymentDueDate'), 'paymentDueDate');
+
+		if (!v.ok()) return fail(400, { error: v.failMessage(), errors: v.errors });
+
+		updateSegment(u.id, parseTripId(params), segmentId!, {
+			title: title!,
+			localStart: localStart!,
+			startTz: startTz!,
+			endAt: endAt ?? undefined,
+			endTz: endTz ?? undefined,
+			location,
+			countryCode,
+			cityName,
+			cityLat,
+			cityLng,
+			venue,
+			confirmationNumber,
+			meetingPoint,
+			meetingAt: meetingAt ?? undefined,
+			cardId,
+			details,
+			paymentStatus,
+			paymentDueDate
+		});
+		throw redirect(303, `/trips/${params.id}`);
+	}
+};

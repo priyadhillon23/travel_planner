@@ -1,0 +1,325 @@
+import { test, expect, vi } from 'vitest';
+import { randomUUID } from 'node:crypto';
+
+const ctx = vi.hoisted(() => ({ kit: null as never, sendMail: vi.fn(async () => true) }));
+vi.mock('$lib/server/db', async () => {
+	const { freshDb } = await import('../../../../../tests/helpers');
+	Object.assign(ctx, freshDb());
+	return ctx;
+});
+vi.mock('$lib/server/notify', () => ({ sendMail: ctx.sendMail }));
+
+import {
+	actions,
+	load,
+	_shareWithUserEmail as shareWithUserEmail,
+	_shareWithGroup as shareWithGroup,
+	_unshareUser as unshareUser,
+	_unshareGroup as unshareGroup,
+	_mintPublicToken as mintPublicToken,
+	_setShowDetails as setShowDetails,
+	_setPublicShowDetails as setPublicShowDetails
+} from './+page.server';
+import { canView, canEdit, listGroupsForUser } from '$lib/server/sharing';
+import { tripShares, auditLogs } from '$lib/server/db/mongrelSchema';
+import { eq, type KitDatabase } from '@visorcraft/mongreldb-kit';
+import * as usersRepo from '$lib/server/repositories/usersRepo';
+import * as tripsRepo from '$lib/server/repositories/tripsRepo';
+
+function kitDb(): KitDatabase {
+	return (ctx as { kit: KitDatabase }).kit;
+}
+
+function makeUser(email: string) {
+	const u = usersRepo.createUser({
+		email,
+		password_hash: 'x',
+		display_name: email,
+		calendar_token: null,
+		calendar_token_expires_at: null
+	});
+	return { ...u, id: Number(u.id) };
+}
+
+function makeTrip(ownerId: number, name: string) {
+	return tripsRepo.createTrip(ownerId, { name, calendarToken: randomUUID() });
+}
+
+test('share page grants access and emails the trip link', async () => {
+	const owner = makeUser('mail-owner@x.c');
+	const guest = makeUser('mail-guest@x.c');
+	const trip = makeTrip(owner.id, 'Mail trip');
+	const form = new FormData();
+	form.set('email', guest.email);
+	form.set('permission', 'edit');
+
+	await expect(
+		actions.shareUser({
+			locals: { user: { id: owner.id } },
+			params: { id: String(trip.id) },
+			url: new URL(`https://roamarr.test/trips/${trip.id}/share`),
+			cookies: { set: vi.fn() },
+			request: new Request('https://roamarr.test', { method: 'POST', body: form })
+		} as any)
+	).rejects.toMatchObject({ status: 303, location: `/trips/${trip.id}/share` });
+
+	expect(canEdit(guest.id, trip)).toBe(true);
+	expect(ctx.sendMail).toHaveBeenCalledWith(
+		guest.email,
+		expect.objectContaining({ link: `https://roamarr.test/trips/${trip.id}` }),
+		owner.id
+	);
+});
+
+test('calendar feed is loaded and managed from the share page', async () => {
+	const owner = makeUser('calendar-o@x.c');
+	const trip = makeTrip(owner.id, 'T');
+	const locals = { user: { id: owner.id } } as App.Locals;
+	const params = { id: String(trip.id) };
+	const data = load({ locals, params, url: new URL(`https://roamarr.test/trips/${trip.id}/share`) } as any) as {
+		feedUrl: string;
+	};
+	expect(data.feedUrl).toContain(`/trips/${trip.id}/calendar/feed?token=`);
+
+	const cookies = { set: vi.fn() };
+	const oldToken = tripsRepo.getTripById(trip.id)!.calendarToken;
+	await expect(
+		actions.regenerateCalendarFeed({
+			locals,
+			params,
+			cookies,
+			request: new Request('https://roamarr.test', { method: 'POST', body: new FormData() })
+		} as any)
+	).rejects.toMatchObject({ status: 303, location: `/trips/${trip.id}/share` });
+	expect(tripsRepo.getTripById(trip.id)!.calendarToken).not.toBe(oldToken);
+
+	await expect(actions.revokeCalendarFeed({ locals, params, cookies } as any)).rejects.toMatchObject({
+		status: 303,
+		location: `/trips/${trip.id}/share`
+	});
+	expect(tripsRepo.getTripById(trip.id)!.calendarToken).toBeNull();
+});
+
+test('owner can revoke a user share', () => {
+	const kit = kitDb();
+	const a = makeUser('a@x.c');
+	const b = makeUser('b@x.c');
+	const t = makeTrip(a.id, 'T');
+	shareWithUserEmail(a.id, t.id, 'b@x.c');
+	expect(canView(b.id, t)).toBe(true);
+	const share = kit.selectFrom(tripShares).where(eq(tripShares.trip_id, BigInt(t.id))).executeSync()[0]!;
+	const shareId = Number(share.id);
+	unshareUser(a.id, t.id, shareId);
+	expect(kit.selectFrom(tripShares).where(eq(tripShares.trip_id, BigInt(t.id))).executeSync().length).toBe(0);
+	expect(canView(b.id, t)).toBe(false);
+
+	const logs = kit.selectFrom(auditLogs).where(eq(auditLogs.user_id, BigInt(a.id))).executeSync();
+	expect(logs).toHaveLength(2);
+	expect(logs[0].action).toBe('trip_share_user');
+	expect(JSON.parse(logs[0].meta_json as string).sharedWithUserId).toBe(b.id);
+	expect(logs[1].action).toBe('trip_unshare_user');
+	expect(JSON.parse(logs[1].meta_json as string).shareId).toBe(shareId);
+});
+
+test('owner can revoke a group share', () => {
+	const kit = kitDb();
+	const owner = makeUser('o@x.c');
+	const member = makeUser('m@x.c');
+	const t = makeTrip(owner.id, 'T');
+	const g = tripsRepo.createGroup({ ownerId: owner.id, name: 'fam' });
+	tripsRepo.addGroupMember(g.id, member.id);
+	shareWithGroup(owner.id, t.id, g.id);
+	expect(canView(member.id, t)).toBe(true);
+
+	const share = kit.selectFrom(tripShares).where(eq(tripShares.trip_id, BigInt(t.id))).executeSync()[0]!;
+	unshareGroup(owner.id, t.id, Number(share.id));
+	expect(kit.selectFrom(tripShares).where(eq(tripShares.trip_id, BigInt(t.id))).executeSync().length).toBe(0);
+	expect(canView(member.id, t)).toBe(false);
+
+	const logs = kit.selectFrom(auditLogs).where(eq(auditLogs.user_id, BigInt(owner.id))).executeSync();
+	expect(logs).toHaveLength(2);
+	expect(logs[0].action).toBe('trip_share_group');
+	expect(JSON.parse(logs[0].meta_json as string).sharedWithGroupId).toBe(g.id);
+	expect(logs[1].action).toBe('trip_unshare_group');
+});
+
+test('non-owner cannot revoke a share', () => {
+	const kit = kitDb();
+	const a = makeUser('no-a@x.c');
+	const b = makeUser('no-b@x.c');
+	const t = makeTrip(a.id, 'T');
+	shareWithUserEmail(a.id, t.id, 'no-b@x.c');
+	const share = kit.selectFrom(tripShares).where(eq(tripShares.trip_id, BigInt(t.id))).executeSync()[0]!;
+	expect(() => unshareUser(b.id, t.id, Number(share.id))).toThrow();
+	expect(kit.selectFrom(tripShares).where(eq(tripShares.trip_id, BigInt(t.id))).executeSync().length).toBe(1);
+
+	const logs = kit.selectFrom(auditLogs).where(eq(auditLogs.user_id, BigInt(a.id))).executeSync();
+	expect(logs).toHaveLength(1);
+	expect(logs[0].action).toBe('trip_share_user');
+	expect(kit.selectFrom(auditLogs).where(eq(auditLogs.user_id, BigInt(b.id))).executeSync()).toHaveLength(0);
+});
+
+test('user unshare does not delete group shares and vice versa', () => {
+	const kit = kitDb();
+	const owner = makeUser('mix-o@x.c');
+	const friend = makeUser('mix-f@x.c');
+	const t = makeTrip(owner.id, 'T');
+	const g = tripsRepo.createGroup({ ownerId: owner.id, name: 'fam' });
+
+	shareWithUserEmail(owner.id, t.id, 'mix-f@x.c');
+	shareWithGroup(owner.id, t.id, g.id);
+	const allShares = kit
+		.selectFrom(tripShares)
+		.where(eq(tripShares.trip_id, BigInt(t.id)))
+		.executeSync();
+	const userShare = allShares.find((s) => Number(s.shared_with_user_id) === friend.id)!;
+	const groupShare = allShares.find((s) => Number(s.shared_with_group_id) === g.id)!;
+
+	unshareUser(owner.id, t.id, Number(userShare.id));
+	expect(
+		kit
+			.selectFrom(tripShares)
+			.where(eq(tripShares.trip_id, BigInt(t.id)))
+			.executeSync()
+			.map((s) => Number(s.id))
+	).toEqual([Number(groupShare.id)]);
+	unshareGroup(owner.id, t.id, Number(groupShare.id));
+	expect(kit.selectFrom(tripShares).where(eq(tripShares.trip_id, BigInt(t.id))).executeSync().length).toBe(0);
+});
+
+test('minting a public token is audited', () => {
+	const kit = kitDb();
+	const owner = makeUser('pub-o@x.c');
+	const t = makeTrip(owner.id, 'T');
+	mintPublicToken(owner.id, t.id);
+	const logs = kit.selectFrom(auditLogs).where(eq(auditLogs.user_id, BigInt(owner.id))).executeSync();
+	expect(logs).toHaveLength(1);
+	expect(logs[0].action).toBe('trip_public_token_mint');
+	expect(logs[0].entity_type).toBe('trip');
+	expect(Number(logs[0].entity_id)).toBe(t.id);
+});
+
+test('share functions default to read and accept edit permission', () => {
+	const kit = kitDb();
+	const owner = makeUser('perm-o@x.c');
+	const reader = makeUser('perm-r@x.c');
+	const editor = makeUser('perm-e@x.c');
+	const t = makeTrip(owner.id, 'T');
+
+	shareWithUserEmail(owner.id, t.id, reader.email);
+	shareWithUserEmail(owner.id, t.id, editor.email, 'edit');
+
+	const shares = kit.selectFrom(tripShares).where(eq(tripShares.trip_id, BigInt(t.id))).executeSync();
+	expect(shares.find((s) => Number(s.shared_with_user_id) === reader.id)?.permission).toBe('read');
+	expect(shares.find((s) => Number(s.shared_with_user_id) === editor.id)?.permission).toBe('edit');
+	expect(canEdit(reader.id, t)).toBe(false);
+	expect(canEdit(editor.id, t)).toBe(true);
+
+	shareWithUserEmail(owner.id, t.id, reader.email, 'edit');
+	expect(tripsRepo.getDirectShareForTrip(t.id, reader.id)?.permission).toBe('edit');
+});
+
+test('group share can be created with edit permission', () => {
+	const kit = kitDb();
+	const owner = makeUser('gperm-o@x.c');
+	const member = makeUser('gperm-m@x.c');
+	const t = makeTrip(owner.id, 'T');
+	const g = tripsRepo.createGroup({ ownerId: owner.id, name: 'editors' });
+	tripsRepo.addGroupMember(g.id, member.id);
+
+	shareWithGroup(owner.id, t.id, g.id, 'edit');
+	const share = kit.selectFrom(tripShares).where(eq(tripShares.trip_id, BigInt(t.id))).executeSync()[0]!;
+	expect(share.permission).toBe('edit');
+	expect(canEdit(member.id, t)).toBe(true);
+});
+
+test('owner can toggle showDetails on a share; non-owner cannot', () => {
+	const kit = kitDb();
+	const owner = makeUser('details-o@x.c');
+	const friend = makeUser('details-f@x.c');
+	const t = makeTrip(owner.id, 'T');
+	shareWithUserEmail(owner.id, t.id, friend.email);
+	const share = kit.selectFrom(tripShares).where(eq(tripShares.trip_id, BigInt(t.id))).executeSync()[0]!;
+	const shareId = Number(share.id);
+	expect(share.show_details).toBe(false);
+
+	setShowDetails(owner.id, t.id, shareId, true);
+	const updated = kit.selectFrom(tripShares).where(eq(tripShares.id, share.id)).executeSync()[0]!;
+	expect(updated.show_details).toBe(true);
+
+	expect(() => setShowDetails(friend.id, t.id, shareId, false)).toThrow();
+	expect(kit.selectFrom(tripShares).where(eq(tripShares.id, share.id)).executeSync()[0]!.show_details).toBe(true);
+
+	const logs = kit.selectFrom(auditLogs).where(eq(auditLogs.user_id, BigInt(owner.id))).executeSync();
+	expect(logs.some((l) => l.action === 'trip_share_set_show_details')).toBe(true);
+});
+
+
+test('member can share their own trip into a group they belong to', () => {
+	const kit = kitDb();
+	const owner = makeUser('mem-o@x.c');
+	const member = makeUser('mem-m@x.c');
+	const other = makeUser('mem-other@x.c');
+	const g = tripsRepo.createGroup({ ownerId: owner.id, name: 'fam' });
+	tripsRepo.addGroupMember(g.id, member.id);
+	tripsRepo.addGroupMember(g.id, other.id);
+	const t = makeTrip(member.id, 'Member Trip');
+
+	shareWithGroup(member.id, t.id, g.id);
+	const share = kit.selectFrom(tripShares).where(eq(tripShares.trip_id, BigInt(t.id))).executeSync()[0]!;
+	expect(Number(share.shared_with_group_id)).toBe(g.id);
+	expect(canView(other.id, t)).toBe(true);
+});
+
+test('user cannot share into a group they do not belong to', () => {
+	const kit = kitDb();
+	const a = makeUser('no-mem-a@x.c');
+	const b = makeUser('no-mem-b@x.c');
+	const g = tripsRepo.createGroup({ ownerId: a.id, name: 'private' });
+	const t = makeTrip(b.id, 'B Trip');
+
+	expect(() => shareWithGroup(b.id, t.id, g.id)).toThrow();
+	expect(kit.selectFrom(tripShares).where(eq(tripShares.trip_id, BigInt(t.id))).executeSync()).toHaveLength(0);
+});
+
+test('listGroupsForUser returns owned and member groups', () => {
+	const a = makeUser('lg-a@x.c');
+	const b = makeUser('lg-b@x.c');
+	tripsRepo.createGroup({ ownerId: a.id, name: 'Owned' });
+	const memberGroup = tripsRepo.createGroup({ ownerId: b.id, name: 'Member' });
+	tripsRepo.addGroupMember(memberGroup.id, a.id);
+	tripsRepo.createGroup({ ownerId: b.id, name: 'Other' });
+
+	const list = listGroupsForUser(a.id);
+	expect(list.map((g) => g.name).sort()).toEqual(['Member', 'Owned']);
+});
+
+test('public token can be minted with showDetails enabled', () => {
+	const kit = kitDb();
+	const owner = makeUser('pub-det-o@x.c');
+	const t = makeTrip(owner.id, 'T');
+
+	mintPublicToken(owner.id, t.id, true);
+	const updated = tripsRepo.getTripById(t.id)!;
+	expect(updated.publicToken).toBeTruthy();
+	expect(updated.publicShowDetails).toBe(true);
+
+	const logs = kit.selectFrom(auditLogs).where(eq(auditLogs.user_id, BigInt(owner.id))).executeSync();
+	expect(logs.some((l) => l.action === 'trip_public_token_mint' && JSON.parse(String(l.meta_json)).publicShowDetails === true)).toBe(true);
+});
+
+test('owner can toggle publicShowDetails; non-owner cannot', () => {
+	const owner = makeUser('pub-toggle-o@x.c');
+	const other = makeUser('pub-toggle-x@x.c');
+	const t = makeTrip(owner.id, 'T');
+
+	setPublicShowDetails(owner.id, t.id, true);
+	expect(tripsRepo.getTripById(t.id)!.publicShowDetails).toBe(true);
+
+	expect(() => setPublicShowDetails(other.id, t.id, false)).toThrow();
+	expect(tripsRepo.getTripById(t.id)!.publicShowDetails).toBe(true);
+
+	const kit = kitDb();
+	const logs = kit.selectFrom(auditLogs).where(eq(auditLogs.user_id, BigInt(owner.id))).executeSync();
+	expect(logs.some((l) => l.action === 'trip_public_set_show_details')).toBe(true);
+});

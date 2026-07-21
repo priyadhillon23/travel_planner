@@ -1,0 +1,82 @@
+import { test, expect, vi, beforeEach } from 'vitest';
+import { eq } from '@visorcraft/mongreldb-kit';
+
+const ctx = vi.hoisted(() => ({ kit: null as never }));
+vi.mock('$lib/server/db', async () => {
+	const { freshDb } = await import('../../../../tests/helpers');
+	Object.assign(ctx, freshDb());
+	return ctx;
+});
+
+import { load, actions } from './+page.server';
+import { createPasswordResetToken } from '$lib/server/passwordReset';
+import { users, passwordResetTokens } from '$lib/server/db/mongrelSchema';
+import { verifyPassword } from '$lib/server/auth';
+import { resetRateLimit } from '$lib/server/rateLimit';
+import { makeKitUser } from '../../../../tests/kitHelpers';
+
+function makeEvent(token: string, formData?: Map<string, string>, ip = '127.0.0.1') {
+	return {
+		params: { token },
+		request: { formData: async () => formData ?? new Map() },
+		getClientAddress: () => ip
+	} as any;
+}
+
+beforeEach(() => {
+	const kit = (ctx as any).kit;
+	kit.deleteFrom(passwordResetTokens).executeSync();
+	kit.deleteFrom(users).executeSync();
+	resetRateLimit();
+});
+
+test('load returns token for valid reset link, 404 for invalid', () => {
+	const u = makeKitUser({ email: 'a@b.c', password_hash: 'x', display_name: 'A' });
+	const token = createPasswordResetToken(Number(u.id));
+	expect(load(makeEvent(token))).toEqual({ token });
+	expect(() => load(makeEvent('bad-token'))).toThrow(expect.objectContaining({ status: 404 }));
+});
+
+test('action rejects short or mismatched passwords', async () => {
+	const u = makeKitUser({ email: 'a@b.c', password_hash: 'x', display_name: 'A' });
+	const token = createPasswordResetToken(Number(u.id));
+	const short = (await actions.default(
+		makeEvent(token, new Map([['password', 'short'], ['confirmPassword', 'short']]))
+	)) as { status: number; data: { error: string } };
+	expect(short.status).toBe(400);
+	expect(short.data.error).toMatch(/at least 8/i);
+	const mismatch = (await actions.default(
+		makeEvent(token, new Map([['password', 'longenough'], ['confirmPassword', 'different']]))
+	)) as { status: number; data: { error: string } };
+	expect(mismatch.status).toBe(400);
+	expect(mismatch.data.error).toMatch(/do not match/i);
+});
+
+test('action consumes token, updates password, and redirects', async () => {
+	const u = makeKitUser({ email: 'a@b.c', password_hash: 'x', display_name: 'A' });
+	const token = createPasswordResetToken(Number(u.id));
+	await expect(
+		actions.default(makeEvent(token, new Map([['password', 'newpassword'], ['confirmPassword', 'newpassword']])))
+	).rejects.toEqual(expect.objectContaining({ status: 303, location: '/login' }));
+	const updated = (ctx as any).kit.selectFrom(users).where(eq(users.id, BigInt(u.id))).executeSync()[0];
+	expect(await verifyPassword(updated!.password_hash, 'newpassword')).toBe(true);
+});
+
+test('action is rate limited', async () => {
+	const u = makeKitUser({ email: 'a@b.c', password_hash: 'x', display_name: 'A' });
+	const token = createPasswordResetToken(Number(u.id));
+	const body = new Map([['password', 'newpassword'], ['confirmPassword', 'newpassword']]);
+	for (let i = 0; i < 10; i++) {
+		try {
+			await actions.default(makeEvent(token, body, '10.0.0.1'));
+		} catch {
+			// expected redirect on success
+		}
+	}
+	const limited = (await actions.default(makeEvent(token, body, '10.0.0.1'))) as {
+		status: number;
+		data: { error: string; retryAfter?: number };
+	};
+	expect(limited.status).toBe(429);
+	expect(limited.data.error).toMatch(/too many attempts/i);
+});

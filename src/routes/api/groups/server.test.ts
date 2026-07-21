@@ -1,0 +1,91 @@
+import { test, expect, vi, beforeEach } from 'vitest';
+
+const ctx = vi.hoisted(() => ({ kit: null as never }));
+vi.mock('$lib/server/db', async () => {
+	const { freshDb } = await import('../../../../tests/helpers');
+	Object.assign(ctx, freshDb());
+	return ctx;
+});
+
+import { GET } from './+server';
+import { makeUser, makeGroup, makeGroupMember } from '../../../../tests/helpers';
+import { resetRateLimit } from '$lib/server/rateLimit';
+
+beforeEach(() => {
+	resetRateLimit();
+});
+
+function makeEvent(url: string, user: unknown) {
+	return {
+		url: new URL(url, 'http://localhost'),
+		locals: { user },
+		getClientAddress: () => '127.0.0.1'
+	} as any;
+}
+
+test('returns paginated groups with member counts', async () => {
+	const owner = makeUser(ctx.kit);
+	const member = makeUser(ctx.kit);
+	const group = makeGroup(ctx.kit, owner.id, 'Family');
+	makeGroupMember(ctx.kit, group.id, owner.id);
+	makeGroupMember(ctx.kit, group.id, member.id);
+
+	const res = await GET(makeEvent('/api/groups', owner));
+	expect(res.status).toBe(200);
+
+	const body = await res.json();
+	expect(body.total).toBe(1);
+	expect(body.rows).toHaveLength(1);
+	expect(body.rows[0]).toMatchObject({
+		id: group.id,
+		name: 'Family',
+		createdAt: group.createdAt,
+		memberCount: 2
+	});
+});
+
+test('does not expose groups owned by other users', async () => {
+	const userA = makeUser(ctx.kit);
+	const userB = makeUser(ctx.kit);
+	makeGroup(ctx.kit, userA.id, 'Family');
+
+	const res = await GET(makeEvent('/api/groups', userB));
+	expect(res.status).toBe(200);
+
+	const body = await res.json();
+	expect(body.total).toBe(0);
+	expect(body.rows).toEqual([]);
+});
+
+test('does not expose groups where user is only a member', async () => {
+	const owner = makeUser(ctx.kit);
+	const member = makeUser(ctx.kit);
+	const group = makeGroup(ctx.kit, owner.id, 'Family');
+	makeGroupMember(ctx.kit, group.id, member.id);
+
+	const res = await GET(makeEvent('/api/groups', member));
+	expect(res.status).toBe(200);
+
+	const body = await res.json();
+	expect(body.total).toBe(0);
+	expect(body.rows).toEqual([]);
+});
+
+test('rejects unauthenticated requests', async () => {
+	await expect(GET(makeEvent('/api/groups', null))).rejects.toMatchObject({ status: 401 });
+});
+
+test('rate limits repeated list requests', async () => {
+	const owner = makeUser(ctx.kit);
+	makeGroup(ctx.kit, owner.id, 'Family');
+
+	for (let i = 0; i < 10; i++) {
+		const res = await GET(makeEvent('/api/groups', owner));
+		expect(res.status).toBe(200);
+	}
+
+	const res = await GET(makeEvent('/api/groups', owner));
+	expect(res.status).toBe(429);
+	const body = await res.json();
+	expect(body.error).toBe('Too many attempts. Try again later.');
+});

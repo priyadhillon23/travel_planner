@@ -1,0 +1,69 @@
+node_modules
+src/lib/server/repositories/node_modules/
+
+# Output
+.output
+.vercel
+.netlify
+.wrangler
+/.svelte-kit
+/build
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.*
+!.env.example
+!.env.test
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+PLAN.md
+/.claude/
+/docs/specs/
+/docs/superpowers/
+
+# Vite
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+
+# Local dev container
+compose.local.yml
+
+# Local database files (legacy SQLite + kit data directories)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+# MongrelDB Kit data directories
+roamarr-db/
+roamarr-test-db/
+/data
+
+# Logs and local QA artifacts
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.superpowers/
+/docs/superpowers/
+.playwright-mcp/
+playwright-report/
+test-results/
+tests/e2e/.auth/
+roamarr-*.png
+attachments/
+!src/lib/server/attachments/
+roamarr.db
+
+# Local migration/alter notes (do not commit)
+ALTER_DB.md

@@ -1,0 +1,133 @@
+import { error, redirect, type RequestEvent } from '@sveltejs/kit';
+import { requireUser } from '$lib/server/auth';
+import * as templatesRepo from './repositories/templatesRepo';
+import * as tripMiscRepo from './repositories/tripMiscRepo';
+import { getOrCreateChecklist } from './tripChecklists';
+import { requireEditableTrip } from './ownership';
+import { logAudit } from './audit';
+import { Validator } from './validation';
+import { parseTripId } from './params';
+
+const TEMPLATE_NAME_MAX = 100;
+const ITEM_LABEL_MAX = 200;
+const ITEM_CATEGORY_MAX = 50;
+
+export type { PackingTemplate } from './repositories/templatesRepo';
+
+function requireTemplateOwner(userId: number, templateId: number) {
+	const template = templatesRepo.getPackingTemplateById(templateId);
+	if (!template || template.userId !== userId) throw error(404, 'Template not found');
+	return template;
+}
+
+function loadChecklistItems(tripId: number) {
+	const checklist = tripMiscRepo.getChecklistByTripId(tripId);
+	if (!checklist) return [];
+	return tripMiscRepo
+		.listItemsForChecklist(checklist.id)
+		.map((i) => ({ text: i.text }));
+}
+
+function validateTemplateInput(name: unknown, items: { label: string; category?: string }[]) {
+	const validator = new Validator();
+	const templateName = validator.requiredString(name, 'name', { max: TEMPLATE_NAME_MAX });
+	if (!items.length) {
+		validator.addError('items', 'At least one item is required');
+	}
+	for (let i = 0; i < items.length; i++) {
+		const prefix = `items[${i}]`;
+		const label = validator.requiredString(items[i]?.label, `${prefix}.label`, { max: ITEM_LABEL_MAX });
+		const category = validator.optionalString(items[i]?.category, `${prefix}.category`, {
+			max: ITEM_CATEGORY_MAX
+		});
+		if (label != null) items[i].label = label;
+		if (category != null) items[i].category = category;
+	}
+	if (!validator.ok()) throw error(400, validator.failMessage());
+	return { templateName: templateName! };
+}
+
+function insertTemplate(
+	userId: number,
+	name: string,
+	items: { label: string; category?: string }[],
+	fromTripId?: number
+) {
+	const template = templatesRepo.createPackingTemplate({ userId, name });
+	if (items.length) {
+		for (const item of items) {
+			templatesRepo.createPackingTemplateItem({
+				templateId: template.id,
+				label: item.label,
+				category: item.category
+			});
+		}
+	}
+	logAudit(userId, 'packing_template_save', 'packing_template', template.id, {
+		fromTripId,
+		itemCount: items.length
+	});
+	return template.id;
+}
+
+export function saveTemplate(
+	userId: number,
+	name: string,
+	items: { label: string; category?: string }[],
+	fromTripId?: number
+) {
+	if (fromTripId != null) {
+		requireEditableTrip(userId, fromTripId);
+		const checklistItems = loadChecklistItems(fromTripId);
+		items = checklistItems.map((i) => ({ label: i.text, category: 'general' }));
+	}
+	validateTemplateInput(name, items);
+	return insertTemplate(userId, name.trim(), items, fromTripId);
+}
+
+export function listTemplates(userId: number): templatesRepo.PackingTemplate[] {
+	return templatesRepo.listPackingTemplates(userId);
+}
+
+function applyTx(templateId: number, tripId: number, userId: number) {
+	const template = requireTemplateOwner(userId, templateId);
+	const items = templatesRepo.listPackingTemplateItems(templateId);
+	const checklist = getOrCreateChecklist(tripId);
+	if (items.length) {
+		for (const item of items) {
+			tripMiscRepo.createChecklistItem({ checklistId: checklist.id, text: item.label });
+		}
+	}
+	logAudit(userId, 'packing_template_apply', 'trip_checklist', checklist.id, {
+		templateId,
+		tripId,
+		itemCount: items.length
+	});
+	return { template, itemCount: items.length };
+}
+
+export function applyTemplate(templateId: number, tripId: number, userId: number) {
+	requireEditableTrip(userId, tripId);
+	return applyTx(templateId, tripId, userId);
+}
+
+export async function saveChecklistTemplate({ locals, params, request }: RequestEvent) {
+	const u = requireUser(locals);
+	const tripId = parseTripId(params);
+	const f = await request.formData();
+	const name = String(f.get('name') || '');
+	const fromTripId = f.get('fromTripId') != null ? tripId : undefined;
+	saveTemplate(u.id, name, [], fromTripId);
+	throw redirect(303, `/trips/${tripId}`);
+}
+
+export async function applyChecklistTemplate({ locals, params, request }: RequestEvent) {
+	const u = requireUser(locals);
+	const tripId = parseTripId(params);
+	const templateIdRaw = (await request.formData()).get('templateId');
+	const validator = new Validator();
+	const templateId = validator.positiveId(templateIdRaw, 'templateId');
+	if (templateId == null) throw error(400, validator.failMessage());
+	applyTemplate(templateId, tripId, u.id);
+	throw redirect(303, `/trips/${tripId}`);
+}

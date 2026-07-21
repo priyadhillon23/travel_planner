@@ -1,0 +1,223 @@
+import { eq as kitEq } from '@visorcraft/mongreldb-kit';
+import { randomBytes } from 'node:crypto';
+import { hashPassword, invalidateAllSessions, invalidateOtherSessions } from './auth';
+import { logAudit } from './audit';
+import { kit } from './db';
+import { users } from './db/mongrelSchema';
+import * as usersRepo from './repositories/usersRepo';
+import { createPasswordResetToken } from './passwordReset';
+import { deliver } from './notify';
+import { revokeTokensForUser } from './oauth';
+import { getSettings } from './settings';
+
+export function normalizeEmail(raw: string): string {
+	return raw.trim().toLowerCase();
+}
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+$/;
+
+function validateEmail(email: string): void {
+	if (!email || email.length > 254 || !EMAIL_RE.test(email)) {
+		throw new Error('A valid email is required.');
+	}
+}
+
+function validateDisplayName(displayName: string): void {
+	if (!displayName || displayName.length > 200) {
+		throw new Error('Display name is required and must be 200 characters or fewer.');
+	}
+}
+
+export async function registerUser(emailRaw: string, password: string, displayNameRaw: string) {
+	const defaults = getSettings();
+	const email = normalizeEmail(emailRaw);
+	const displayName = displayNameRaw.trim();
+	validateEmail(email);
+	validateDisplayName(displayName);
+	if (usersRepo.getUserByEmail(email)) throw new Error('Email already registered.');
+	const user = usersRepo.createUser({
+		email,
+		password_hash: await hashPassword(password),
+		display_name: displayName,
+		role: 'user',
+		disabled: false,
+		must_reset_password: false,
+		timezone: defaults.defaultTimezone,
+		flight_checkin_lead_hours: BigInt(defaults.defaultFlightCheckinLeadHours),
+		document_expiry_lead_days: BigInt(defaults.defaultDocumentExpiryLeadDays),
+		email_notifications: true,
+		webhook_notifications: true,
+		theme_id: 'system',
+		default_currency: defaults.defaultCurrency,
+		calendar_token: null,
+		calendar_token_expires_at: null
+	} as usersRepo.CreateUserInput);
+	return {
+		id: Number(user.id),
+		email: user.email,
+		displayName: user.display_name ?? '',
+		role: user.role,
+		timezone: user.timezone,
+		flightCheckinLeadHours: Number(user.flight_checkin_lead_hours),
+		documentExpiryLeadDays: Number(user.document_expiry_lead_days)
+	};
+}
+
+function countAdmins() {
+	return kit.selectFrom(users).where(kitEq(users.role, 'admin')).executeSync().length;
+}
+
+function assertCanChangeAdminAccess(
+	target: usersRepo.KitUser,
+	patch: { role?: 'admin' | 'user'; disabled?: boolean },
+	actorId: number
+) {
+	const demoting = patch.role === 'user' && target.role === 'admin';
+	const disabling = patch.disabled === true && !target.disabled;
+	const affectsSelf = Number(target.id) === actorId;
+	if ((demoting || disabling) && affectsSelf && countAdmins() <= 1) {
+		throw new Error('Cannot remove the last admin.');
+	}
+}
+
+interface AdminCreateUserInput {
+	displayName: string;
+	email: string;
+	role?: 'admin' | 'user';
+}
+
+export async function adminCreateUser(actorId: number, input: AdminCreateUserInput) {
+	const displayName = input.displayName.trim();
+	const email = normalizeEmail(input.email);
+	validateDisplayName(displayName);
+	validateEmail(email);
+
+	const duplicate = usersRepo.getUserByEmail(email);
+	if (duplicate) throw new Error('That email is already in use.');
+
+	const role = input.role === 'admin' ? 'admin' : 'user';
+	const temporaryPassword = randomBytes(16).toString('base64url');
+	const passwordHash = await hashPassword(temporaryPassword);
+
+	const created = usersRepo.createUser({
+		email,
+		password_hash: passwordHash,
+		display_name: displayName,
+		must_reset_password: true,
+		calendar_token: null,
+		calendar_token_expires_at: null
+	} as usersRepo.CreateUserInput);
+	if (role === 'admin') {
+		usersRepo.updateUser(Number(created.id), { role: 'admin' });
+	}
+
+	logAudit(actorId, 'user_create', 'user', Number(created.id), { role });
+	return { user: created, temporaryPassword };
+}
+
+export async function adminDeleteUser(actorId: number, userId: number) {
+	const target = usersRepo.getUserById(userId);
+	if (!target) throw new Error('User not found.');
+
+	if (target.role === 'admin' && countAdmins() <= 1) {
+		throw new Error('Cannot delete the last admin.');
+	}
+
+	usersRepo.deleteUser(userId);
+	// oauth_tokens has no FK cascade, so revoke MCP tokens explicitly to avoid
+	// leaving orphaned (otherwise-valid-looking) rows behind.
+	revokeTokensForUser(userId);
+	logAudit(actorId, 'user_delete', 'user', userId, { email: target.email, role: target.role });
+}
+
+interface AdminUpdateUserInput {
+	displayName: string;
+	email: string;
+	role: 'admin' | 'user';
+	disabled: boolean;
+	mustResetPassword: boolean;
+	newPassword?: string;
+	confirmPassword?: string;
+}
+
+export async function adminUpdateUser(
+	actorId: number,
+	userId: number,
+	input: AdminUpdateUserInput
+) {
+	const target = usersRepo.getUserById(userId);
+	if (!target) throw new Error('User not found.');
+
+	const displayName = input.displayName.trim();
+	const email = normalizeEmail(input.email);
+	validateDisplayName(displayName);
+	validateEmail(email);
+
+	const duplicate = usersRepo.getUserByEmail(email);
+	if (duplicate && Number(duplicate.id) !== userId) throw new Error('That email is already in use.');
+
+	assertCanChangeAdminAccess(target, { role: input.role, disabled: input.disabled }, actorId);
+
+	const patch: Partial<usersRepo.KitUser> = {
+		display_name: displayName,
+		email,
+		role: input.role,
+		disabled: input.disabled,
+		must_reset_password: input.mustResetPassword
+	};
+
+	const newPassword = input.newPassword?.trim() ?? '';
+	const confirmPassword = input.confirmPassword?.trim() ?? '';
+	let passwordChanged = false;
+	if (newPassword || confirmPassword) {
+		if (newPassword.length < 8) throw new Error('New password must be at least 8 characters.');
+		if (newPassword !== confirmPassword) throw new Error('New passwords do not match.');
+		patch.password_hash = await hashPassword(newPassword);
+		if (!input.mustResetPassword) patch.must_reset_password = false;
+		passwordChanged = true;
+	}
+
+	usersRepo.updateUser(userId, patch);
+
+	if (passwordChanged) invalidateAllSessions(userId);
+
+	logAudit(actorId, 'user_update', 'user', userId, {
+		changed: Object.keys(patch),
+		role: input.role,
+		disabled: input.disabled,
+		mustResetPassword: input.mustResetPassword
+	});
+}
+
+export async function adminSendPasswordReset(userId: number, origin: string) {
+	const target = usersRepo.getUserById(userId);
+	if (!target) throw new Error('User not found.');
+	if (target.disabled) throw new Error('Cannot reset password for a disabled account.');
+
+	const token = createPasswordResetToken(Number(target.id));
+	const link = `${origin}/reset-password/${token}`;
+	await deliver(Number(target.id), {
+		title: 'Reset your Roamarr password',
+		body: 'An administrator requested a password reset. Click the link below to choose a new password. This link expires in 1 hour.',
+		link
+	});
+}
+
+export async function completeRequiredPasswordChange(
+	userId: number,
+	sessionToken: string,
+	newPassword: string,
+	confirmPassword: string
+) {
+	const u = usersRepo.getUserById(userId);
+	if (!u?.must_reset_password) throw new Error('Password change is not required.');
+	if (newPassword.length < 8) throw new Error('Password must be at least 8 characters.');
+	if (newPassword !== confirmPassword) throw new Error('Passwords do not match.');
+
+	usersRepo.updateUser(userId, {
+		password_hash: await hashPassword(newPassword),
+		must_reset_password: false
+	});
+	invalidateOtherSessions(userId, sessionToken);
+	logAudit(userId, 'password_change', 'user', userId, { forced: true });
+}
