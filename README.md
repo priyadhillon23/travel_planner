@@ -573,16 +573,4 @@ update relevant docs, and run `npm run credits:generate` after dependency
 changes so Credits/Acknowledgements and Third-party Licenses match
 `package-lock.json`.
 
-## Documentation
 
-- [docs/README.md](docs/README.md) - user documentation index
-- [CONTRIBUTING.md](CONTRIBUTING.md) - contribution guidelines
-- [docs/SECURITY.md](docs/SECURITY.md) - security policy and disclosure process
-- [LICENSE](LICENSE) - GPL-3.0-only license text
-- [static/manifest.json](static/manifest.json) - PWA manifest
-
-## License
-
-Roamarr is licensed under GPL-3.0-only. See [LICENSE](LICENSE) for the full
-license text, [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines,
-and [docs/SECURITY.md](docs/SECURITY.md) for the security disclosure policy.
